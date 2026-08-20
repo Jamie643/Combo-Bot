@@ -15,7 +15,7 @@ from flask import Flask
 # Updated symbol formatting for Bybit CCXT linear perpetuals
 TARGET_PAIRS = [
     "DOGE/USDT",
-    "TON/USDT",
+    "GRAM/USDT",
     "XRP/USDT",
     "ADA/USDT",
 ]

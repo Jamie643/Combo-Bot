@@ -182,7 +182,7 @@ def scan_for_matrix_trigger(exchange):
             d_low = df["donchian_low"].iloc[-1]
 
             regime = detect_market_regime(symbol, df)
-            has_volume_ confirmation = volume > (vol_ma * VOLUME_SPIKE_MULT)
+            has_volume_confirmation = volume > (vol_ma * VOLUME_SPIKE_MULT)
 
             if regime == "TREND" and cp >= d_high and has_volume_confirmation:
                 print(f"🎯 Matrix Launch Signal Triggered on {symbol}", flush=True)

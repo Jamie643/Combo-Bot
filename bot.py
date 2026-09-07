@@ -35,10 +35,11 @@ DONCHIAN_PERIOD = 20
 ATR_PERIOD = 14
 VOLUME_SPIKE_MULT = 1.5         # 150% average volume required for breakout confirmation
 
-# Risk & Smart Leverage Configuration
-INITIAL_CORE_MARGIN = 5.00      # USDT allocation for Tier 1
-LEVERAGE_BASELINE = 15          # 15x Baseline Leverage
-LEVERAGE_HYPER = 30             # 30x Hyper Leverage
+# Risk & Smart Margin Sizing Configuration
+SMART_MARGIN_PCT = 0.35         # Dynamically allocates 35% of free balance for Tier 1 entry
+LEVERAGE_SMART_BASE = 3         # Conservative base leverage for Tier 1 (ATR scaled 2x-5x)
+LEVERAGE_BASELINE = 15          # 15x Baseline Leverage for Tiers 3 & 4
+LEVERAGE_HYPER = 30             # 30x Hyper Leverage for Tiers 2 & 5
 
 # Bybit Credentials & Telegram Config
 BYBIT_KEY = os.getenv("BYBIT_API_KEY") or os.getenv("BYBIT_KEY")
@@ -268,7 +269,7 @@ class StateManager:
             "anchor_100": 0.0,
             "active_tier": 0,
             "status": "IDLE",  # IDLE, RUNNING, COMPLETED, FAILED_STOPPED_OUT
-            "current_balance": INITIAL_CORE_MARGIN,
+            "current_balance": 0.0,
             "pending_order_id": None,
         }
 
@@ -304,7 +305,7 @@ class CascadingMatrixManager:
             return float(bal_resp.get("USDT", {}).get("free", 0.0))
         except Exception as e:
             print(f"Error fetching USDT balance: {e}", flush=True)
-            return float(self.state.get("current_balance", INITIAL_CORE_MARGIN))
+            return float(self.state.get("current_balance", 0.0))
 
     def cancel_all_conditional_orders(self):
         """Cancels all pending orders for active asset."""
@@ -319,14 +320,14 @@ class CascadingMatrixManager:
             print(f"Error clearing orders: {e}", flush=True)
 
     def get_tier_config(self, tier):
-        """Maps specific parameters for each Tier using market anchor Fib levels."""
+        """Maps specific parameters for each Tier using market anchor Fib levels and leverage rules."""
         if tier == 1:
             return {
                 "entry_price": self.fibs["0.0"],
                 "trigger_price": None,
                 "tp_price": self.fibs["23.6"],
                 "sl_price": self.fibs["0.0"] * 0.99,
-                "leverage": LEVERAGE_BASELINE,
+                "leverage": LEVERAGE_SMART_BASE,  # 3x Conservative Base
             }
         elif tier == 2:
             return {
@@ -334,7 +335,7 @@ class CascadingMatrixManager:
                 "trigger_price": self.fibs["38.2"],
                 "tp_price": self.fibs["38.2"],
                 "sl_price": self.fibs["0.0"],
-                "leverage": LEVERAGE_HYPER,
+                "leverage": LEVERAGE_HYPER,       # 30x Hyper Surge
             }
         elif tier == 3:
             return {
@@ -342,7 +343,7 @@ class CascadingMatrixManager:
                 "trigger_price": self.fibs["50.0"],
                 "tp_price": self.fibs["50.0"],
                 "sl_price": self.fibs["23.6"],
-                "leverage": LEVERAGE_BASELINE,
+                "leverage": LEVERAGE_BASELINE,    # 15x Mid-Trend
             }
         elif tier == 4:
             return {
@@ -350,7 +351,7 @@ class CascadingMatrixManager:
                 "trigger_price": self.fibs["61.8"],
                 "tp_price": self.fibs["61.8"],
                 "sl_price": self.fibs["38.2"],
-                "leverage": LEVERAGE_BASELINE,
+                "leverage": LEVERAGE_BASELINE,    # 15x Mid-Trend
             }
         elif tier == 5:
             return {
@@ -358,7 +359,7 @@ class CascadingMatrixManager:
                 "trigger_price": self.fibs["78.6"],
                 "tp_price": self.fibs["78.6"],
                 "sl_price": self.fibs["50.0"],
-                "leverage": LEVERAGE_HYPER,
+                "leverage": LEVERAGE_HYPER,       # 30x Hyper Push
             }
         return None
 
@@ -385,12 +386,12 @@ class CascadingMatrixManager:
         self.execute_tier_1()
 
     def execute_tier_1(self):
-        """Launches Tier 1 dynamically aligned to live market price."""
+        """Launches Tier 1 dynamically using Smart Margin Sizing (35% wallet allocation)."""
         config = self.get_tier_config(1)
         safe_set_leverage(self.exchange, config["leverage"], self.symbol)
 
         avail_usdt = self.fetch_available_usdt()
-        margin_to_use = min(INITIAL_CORE_MARGIN, avail_usdt)
+        margin_to_use = avail_usdt * SMART_MARGIN_PCT
 
         if margin_to_use <= 0:
             send_critical_alert("Cannot execute Tier 1: Insufficient available USDT balance.")
@@ -425,7 +426,8 @@ class CascadingMatrixManager:
                 f"🚀 <b>CASCADING TIER 1 EXECUTED</b>\n"
                 f"<b>Pair:</b> {self.symbol} | <b>Price:</b> ${cp:.4f}\n"
                 f"<b>TP:</b> ${config['tp_price']:.4f} | <b>SL:</b> ${config['sl_price']:.4f}\n"
-                f"<b>Leverage:</b> {config['leverage']}x Baseline"
+                f"<b>Margin Allocated:</b> ${margin_to_use:.2f} USDT (35% Smart Size)\n"
+                f"<b>Leverage:</b> {config['leverage']}x Base Conservative"
             )
         except Exception as e:
             send_critical_alert(f"Failed to execute Tier 1: {e}")
@@ -439,8 +441,8 @@ class CascadingMatrixManager:
         safe_set_leverage(self.exchange, config["leverage"], self.symbol)
 
         avail_usdt = self.fetch_available_usdt()
-        target_margin = self.state.get("current_balance", INITIAL_CORE_MARGIN)
-        margin_to_use = min(target_margin, avail_usdt)
+        # Scale margin based on accumulated/compounded wallet balance
+        margin_to_use = avail_usdt * SMART_MARGIN_PCT
 
         if margin_to_use <= 0:
             send_critical_alert(f"Cannot queue Tier {tier}: Insufficient USDT balance.")
@@ -480,7 +482,8 @@ class CascadingMatrixManager:
                 f"⏳ <b>TIER {tier} CONDITIONAL ORDER QUEUED</b>\n"
                 f"<b>Pair:</b> {self.symbol}\n"
                 f"<b>Trigger:</b> ${config['trigger_price']:.4f} | <b>Limit Entry:</b> ${config['entry_price']:.4f}\n"
-                f"<b>Target TP:</b> ${config['tp_price']:.4f} | <b>Leverage:</b> {config['leverage']}x"
+                f"<b>Target TP:</b> ${config['tp_price']:.4f} | <b>Leverage:</b> {config['leverage']}x\n"
+                f"<b>Target Margin:</b> ${margin_to_use:.2f} USDT"
             )
         except Exception as e:
             send_critical_alert(f"Failed to queue Tier {tier} conditional order: {e}")

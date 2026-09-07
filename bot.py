@@ -47,6 +47,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 REGIME_MEMORY = {}
+LAST_PULSE_TIME = 0
 
 # ------------------------------------------------------------------
 # TELEGRAM NOTIFIER
@@ -76,6 +77,28 @@ def send_critical_alert(error_msg):
         f"<b>Details:</b>\n<code>{error_msg}</code>"
     )
     send_telegram(alert_text)
+
+
+def check_and_send_daily_pulse(exchange):
+    """Sends a daily status checkup via Telegram every 24 hours."""
+    global LAST_PULSE_TIME
+    current_time = time.time()
+    
+    # 86400 seconds = 24 hours
+    if current_time - LAST_PULSE_TIME >= 86400:
+        try:
+            usdt_bal = exchange.fetch_balance({"accountType": "UNIFIED"}).get("USDT", {}).get("free", 0.0)
+            status_msg = (
+                "💚 <b>DAILY BOT CHECKUP</b> 💚\n\n"
+                "<b>Status:</b> Active & Scanning 1H Markets\n"
+                f"<b>Pairs Watched:</b> {', '.join(TARGET_PAIRS)}\n"
+                f"<b>Free Balance:</b> ${usdt_bal:.2f} USDT\n"
+                "<i>No breakout triggers matched over the last 24h. Scanner running clean.</i>"
+            )
+            send_telegram(status_msg)
+            LAST_PULSE_TIME = current_time
+        except Exception as e:
+            print(f"Daily pulse error: {e}", flush=True)
 
 
 # ------------------------------------------------------------------
@@ -130,7 +153,7 @@ def calculate_indicators(df):
     df["adx"] = dx.rolling(window=ADX_PERIOD).mean()
 
     df["donchian_high"] = df["high"].shift(1).rolling(window=DONCHIAN_PERIOD).max()
-    df["donchian_low"] = df["low"].shift(1).rolling(window=DONCHIAN_PERIOD).min()
+    df["donchian_low"] = df["high"].shift(1).rolling(window=DONCHIAN_PERIOD).min()
 
     return df
 
@@ -541,8 +564,12 @@ def bot_loop():
 
     matrix = CascadingMatrixManager(exchange)
 
+    # Trigger pulse timer immediately on startup
+    check_and_send_daily_pulse(exchange)
+
     while True:
         try:
+            check_and_send_daily_pulse(exchange)
             matrix.evaluate_matrix_step()
         except Exception as e:
             send_critical_alert(str(e))
@@ -560,4 +587,6 @@ def health_check():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
+    # Start bot loop in background thread
+    threading.Thread(target=bot_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=port)

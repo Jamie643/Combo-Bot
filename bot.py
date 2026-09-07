@@ -34,9 +34,6 @@ DONCHIAN_PERIOD = 20
 ATR_PERIOD = 14
 VOLUME_SPIKE_MULT = 1.5         
 
-# Base Parameters
-BASE_MARGIN = 38.00             # Initial Tier 1 Capital
-
 # Bybit Credentials & Telegram Config
 BYBIT_KEY = os.getenv("BYBIT_API_KEY") or os.getenv("BYBIT_KEY")
 BYBIT_SECRET = os.getenv("BYBIT_API_SECRET") or os.getenv("BYBIT_SECRET")
@@ -110,10 +107,11 @@ def safe_set_leverage(exchange, leverage, symbol):
 # MARKET INDICATORS & REGIME DETECTOR
 # ------------------------------------------------------------------
 def calculate_indicators(df):
+    """Computes RSI, Bollinger Bands, ATR, ADX, Donchian Channels, and Volume MA."""
     delta = df["close"].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=RSI_PERIOD).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=RSI_PERIOD).mean()
-    rs = gain / loss
+    rs = gain / (loss + 1e-10)
     df["rsi"] = 100 - (100 / (1 + rs))
 
     df["sma20"] = df["close"].rolling(window=BB_PERIOD).mean()
@@ -126,7 +124,6 @@ def calculate_indicators(df):
     low_close = np.abs(df["low"] - df["close"].shift(1))
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df["atr"] = tr.rolling(window=ATR_PERIOD).mean()
-    df["atr_ma"] = df["atr"].rolling(window=20).mean()
 
     df["vol_ma20"] = df["volume"].rolling(window=20).mean()
 
@@ -136,48 +133,37 @@ def calculate_indicators(df):
     minus_dm = np.where((down > up) & (down > 0), down, 0.0)
 
     tr_smooth = tr.rolling(window=ADX_PERIOD).sum()
-    plus_di = 100 * (pd.Series(plus_dm).rolling(window=ADX_PERIOD).sum() / tr_smooth)
-    minus_di = 100 * (pd.Series(minus_dm).rolling(window=ADX_PERIOD).sum() / tr_smooth)
-    dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di)
+    plus_di = 100 * (pd.Series(plus_dm).rolling(window=ADX_PERIOD).sum() / (tr_smooth + 1e-10))
+    minus_di = 100 * (pd.Series(minus_dm).rolling(window=ADX_PERIOD).sum() / (tr_smooth + 1e-10))
+    dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-10)
     df["adx"] = dx.rolling(window=ADX_PERIOD).mean()
 
     df["donchian_high"] = df["high"].shift(1).rolling(window=DONCHIAN_PERIOD).max()
-    df["donchian_low"] = df["high"].shift(1).rolling(window=DONCHIAN_PERIOD).min()
+    df["donchian_low"] = df["low"].shift(1).rolling(window=DONCHIAN_PERIOD).min()
 
     return df
 
 
 def detect_market_regime(symbol, df):
+    """Requires 3 consecutive bars with ADX > 22 and expanding ATR."""
     global REGIME_MEMORY
 
-    adx = df["adx"].iloc[-1]
-    atr = df["atr"].iloc[-1]
-    atr_ma = df["atr_ma"].iloc[-1]
+    if len(df) < 20 or "adx" not in df.columns:
+        return "RANGE"
 
-    raw_trending = (adx > 25) and (atr > atr_ma)
-    raw_regime = "TREND" if raw_trending else "RANGE"
+    adx_cond = df["adx"] > 22.0
+    atr_expanding = df["atr"] > df["atr"].shift(1)
+    raw_trending = adx_cond & atr_expanding
 
-    if symbol not in REGIME_MEMORY:
-        REGIME_MEMORY[symbol] = {"last_regime": raw_regime, "bars": 1}
+    recent_regime = raw_trending.tail(3)
+    active_regime = "TREND" if recent_regime.all() else "RANGE"
 
-    state = REGIME_MEMORY[symbol]
-
-    if raw_regime == state["last_regime"]:
-        state["bars"] += 1
-        active_regime = raw_regime
-    else:
-        if state["bars"] < 3:
-            active_regime = state["last_regime"]
-        else:
-            state["last_regime"] = raw_regime
-            state["bars"] = 1
-            active_regime = raw_regime
-
-    REGIME_MEMORY[symbol] = state
+    REGIME_MEMORY[symbol] = {"last_regime": active_regime}
     return active_regime
 
 
 def scan_for_matrix_trigger(exchange):
+    """Scans target pairs for LONG/SHORT Donchian breaches with 1.5x volume confirmation."""
     for symbol in TARGET_PAIRS:
         try:
             ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=100)
@@ -194,15 +180,27 @@ def scan_for_matrix_trigger(exchange):
             regime = detect_market_regime(symbol, df)
             has_volume_confirmation = volume > (vol_ma * VOLUME_SPIKE_MULT)
 
-            if regime == "TREND" and cp >= d_high and has_volume_confirmation:
-                print(f"🎯 Matrix Launch Signal Triggered on {symbol}", flush=True)
-                return {
-                    "symbol": symbol,
-                    "direction": "LONG",
-                    "anchor_0": cp,
-                    "anchor_100": cp + (d_high - d_low),
-                    "atr": atr,
-                }
+            if regime == "TREND" and has_volume_confirmation:
+                # LONG Breakout
+                if cp >= d_high:
+                    print(f"🎯 Matrix Launch Signal Triggered (LONG) on {symbol}", flush=True)
+                    return {
+                        "symbol": symbol,
+                        "direction": "LONG",
+                        "anchor_0": cp,
+                        "anchor_100": cp + (d_high - d_low),
+                        "atr": atr,
+                    }
+                # SHORT Breakout
+                elif cp <= d_low:
+                    print(f"🎯 Matrix Launch Signal Triggered (SHORT) on {symbol}", flush=True)
+                    return {
+                        "symbol": symbol,
+                        "direction": "SHORT",
+                        "anchor_0": cp,
+                        "anchor_100": cp - (d_high - d_low),
+                        "atr": atr,
+                    }
         except Exception as e:
             print(f"Error scanning {symbol}: {e}", flush=True)
 
@@ -254,9 +252,8 @@ class StateManager:
             "atr": 0.0,
             "active_tier": 0,
             "status": "IDLE",  
-            "current_margin": BASE_MARGIN,
             "pending_order_id": None,
-            "realized_pnl_history": {},
+            "orders_placed": {},
         }
 
     @staticmethod
@@ -272,6 +269,14 @@ class StateManager:
 # CASCADING EXECUTION ENGINE
 # ------------------------------------------------------------------
 class CascadingMatrixManager:
+    TIER_CONFIG = {
+        1: {"name": "Base Core", "leverage": 5, "atr_mult": 1.75},
+        2: {"name": "Acceleration Rail", "leverage": 12, "atr_mult": 1.0},
+        3: {"name": "Velocity Maximum", "leverage": 20, "atr_mult": 0.5},
+        4: {"name": "De-escalation Bracket", "leverage": 10, "atr_mult": 1.0},
+        5: {"name": "Terminal Run", "leverage": 5, "atr_mult": 1.5},
+    }
+
     def __init__(self, exchange):
         self.exchange = exchange
         self.state = StateManager.load_state()
@@ -284,6 +289,14 @@ class CascadingMatrixManager:
             self.symbol = None
             self.fibs = {}
 
+    def fetch_available_usdt(self):
+        try:
+            balance = self.exchange.fetch_balance({"accountType": "UNIFIED"})
+            return float(balance.get("USDT", {}).get("free", 0.0))
+        except Exception as e:
+            print(f"Failed to fetch balance: {e}", flush=True)
+            return 0.0
+
     def cancel_all_conditional_orders(self):
         if not self.symbol:
             return
@@ -295,55 +308,51 @@ class CascadingMatrixManager:
         except Exception as e:
             print(f"Error clearing orders: {e}", flush=True)
 
-    def get_tier_config(self, tier):
-        """Maps specific parameters and rules according to exact Fib Table Specs."""
-        atr = self.state.get("atr", 0.0)
+    def calculate_atr_stop_loss(self, entry_price, current_atr, tier, direction):
+        mult = self.TIER_CONFIG[tier]["atr_mult"]
+        offset = current_atr * mult
+        if direction.upper() == "SHORT":
+            return round(entry_price + offset, 4)
+        return round(entry_price - offset, 4)
 
-        if tier == 1:
-            return {
-                "entry_price": self.fibs["0.0"],
-                "trigger_price": None,
-                "tp_price": self.fibs["23.6"],
-                "sl_price": self.fibs["0.0"] - (1.5 * atr),  # 1.5x ATR
-                "leverage": 5,                                # 5x Leverage
-                "margin": BASE_MARGIN,                        # Base Margin ($38.00)
-            }
-        elif tier == 2:
-            t1_pnl = self.state["realized_pnl_history"].get("1", 16.80)
-            margin = BASE_MARGIN + (0.70 * t1_pnl)            # $38 + 70% T1 Profit
-            return {
-                "entry_price": self.fibs["23.6"],
-                "trigger_price": self.fibs["23.6"],
-                "tp_price": self.fibs["38.2"],
-                "sl_price": self.fibs["0.0"],                 # T1 Entry Stop
-                "leverage": 12,                               # 12x Leverage
-                "margin": margin,
-            }
-        elif tier == 3:
-            prev_margin = self.state.get("current_margin", 49.76)
-            t2_pnl = self.state["realized_pnl_history"].get("2", 38.25)
-            margin = prev_margin + (0.70 * t2_pnl)           # Prev. Margin + 70% T2 Profit
-            return {
-                "entry_price": self.fibs["38.2"],
-                "trigger_price": self.fibs["38.2"],
-                "tp_price": self.fibs["61.8"],
-                "sl_price": self.fibs["23.6"] - (0.5 * atr), # 0.5x ATR from T2 Entry
-                "leverage": 20,                               # 20x Leverage
-                "margin": margin,
-            }
+    def get_tier_config(self, tier):
+        """Maps parameters dynamically using 35% Smart Margin Model."""
+        atr = self.state.get("atr", 0.0)
+        direction = self.state.get("direction", "LONG")
+        free_usdt = self.fetch_available_usdt()
+        margin_allocated = free_usdt * 0.35
+
+        fib_mapping = {
+            1: ("0.0", "23.6"),
+            2: ("23.6", "38.2"),
+            3: ("38.2", "50.0"),
+            4: ("50.0", "61.8"),
+            5: ("61.8", "78.6"),
+        }
+
+        if tier not in fib_mapping:
+            return None
+
+        entry_key, tp_key = fib_mapping[tier]
+        entry_price = self.fibs[entry_key]
+        tp_price = self.fibs[tp_key]
+
+        # Stop Loss Logic
+        if tier == 2:
+            sl_price = self.fibs["0.0"]  # Tier 1 Entry Trail-Lock
         elif tier == 4:
-            prev_margin = self.state.get("current_margin", 76.54)
-            t3_pnl = self.state["realized_pnl_history"].get("3", 118.00)
-            margin = prev_margin + (0.50 * t3_pnl)           # Prev. Margin + 50% T3 Profit
-            return {
-                "entry_price": self.fibs["61.8"],
-                "trigger_price": self.fibs["61.8"],
-                "tp_price": self.fibs["78.6"],
-                "sl_price": self.fibs["38.2"],                 # T3 Entry Stop
-                "leverage": 8,                                # 8x De-leverage
-                "margin": margin,
-            }
-        return None
+            sl_price = self.fibs["38.2"] # Tier 3 Entry Lock
+        else:
+            sl_price = self.calculate_atr_stop_loss(entry_price, atr, tier, direction)
+
+        return {
+            "entry_price": entry_price,
+            "trigger_price": entry_price,
+            "tp_price": tp_price,
+            "sl_price": sl_price,
+            "leverage": self.TIER_CONFIG[tier]["leverage"],
+            "margin": margin_allocated,
+        }
 
     def initialize_campaign(self, launch_params):
         self.symbol = launch_params["symbol"]
@@ -353,6 +362,7 @@ class CascadingMatrixManager:
         self.state["anchor_100"] = launch_params["anchor_100"]
         self.state["atr"] = launch_params["atr"]
         self.state["status"] = "RUNNING"
+        self.state["orders_placed"] = {}
 
         self.fibs = calculate_fib_levels(
             launch_params["anchor_0"], launch_params["anchor_100"], launch_params["direction"]
@@ -398,21 +408,25 @@ class CascadingMatrixManager:
                 },
             )
             self.state["active_tier"] = 1
-            self.state["current_margin"] = margin_to_use
             self.state["status"] = "RUNNING"
             self.state["pending_order_id"] = order["id"]
+            self.state["orders_placed"]["1"] = True
             StateManager.save_state(self.state)
 
             send_telegram(
                 f"🚀 <b>CASCADING TIER 1 EXECUTED</b>\n"
                 f"<b>Pair:</b> {self.symbol} | <b>Price:</b> ${formatted_price}\n"
-                f"<b>TP:</b> ${formatted_tp} | <b>SL:</b> ${formatted_sl} (1.5x ATR)\n"
-                f"<b>Margin Allocated:</b> ${margin_to_use:.2f} USDT | <b>Leverage:</b> {config['leverage']}x"
+                f"<b>TP:</b> ${formatted_tp} | <b>SL:</b> ${formatted_sl}\n"
+                f"<b>Smart Margin:</b> ${margin_to_use:.2f} USDT | <b>Leverage:</b> {config['leverage']}x"
             )
         except Exception as e:
             send_critical_alert(f"Failed to execute Tier 1: {e}")
 
     def queue_conditional_tier(self, tier):
+        str_tier = str(tier)
+        if self.state.get("orders_placed", {}).get(str_tier):
+            return
+
         config = self.get_tier_config(tier)
         if not config:
             return
@@ -452,9 +466,9 @@ class CascadingMatrixManager:
             )
 
             self.state["active_tier"] = tier
-            self.state["current_margin"] = margin_to_use
             self.state["status"] = "PENDING_PULLBACK"
             self.state["pending_order_id"] = order["id"]
+            self.state["orders_placed"][str_tier] = True
             StateManager.save_state(self.state)
 
             send_telegram(
@@ -477,28 +491,58 @@ class CascadingMatrixManager:
         ticker = self.exchange.fetch_ticker(self.symbol)
         current_price = ticker["last"]
         active_tier = self.state["active_tier"]
+        next_tier = active_tier + 1
+        direction = self.state["direction"]
 
+        has_pending_order = len(self.exchange.fetch_open_orders(self.symbol)) > 0
+
+        next_config = self.get_tier_config(next_tier)
+        if next_config:
+            next_trigger = next_config["entry_price"]
+            surged_past = (current_price >= next_trigger) if direction == "LONG" else (current_price <= next_trigger)
+
+            # --- GUARDRAIL A: Stale Order Omission Threshold ---
+            if has_pending_order and surged_past:
+                self.cancel_all_conditional_orders()
+                send_telegram(
+                    f"⚡ <b>Guardrail A Activated</b>: Price surged past Tier {next_tier} target (${next_trigger}). "
+                    f"Skipping stale Tier {active_tier} order."
+                )
+                self.state["active_tier"] = next_tier
+                StateManager.save_state(self.state)
+                self.queue_conditional_tier(next_tier)
+                return
+
+            # --- TIER ADVANCE LOGIC ---
+            if surged_past and not self.state.get("orders_placed", {}).get(str(next_tier)):
+                if next_tier == 2:
+                    t1_entry = self.fibs["0.0"]
+                    self.exchange.edit_position_trading_stop(self.symbol, stopLoss=t1_entry)
+                    send_telegram(f"🔒 <b>Tier 2 Activated</b>: Position Stop Loss trail-locked to Tier 1 Entry (${t1_entry}).")
+
+                self.state["active_tier"] = next_tier
+                StateManager.save_state(self.state)
+                self.queue_conditional_tier(next_tier)
+
+        # --- TIER 3 HYPER-TIGHT 0.5x ATR TRAILING STOP ---
+        if active_tier == 3:
+            try:
+                ohlcv = self.exchange.fetch_ohlcv(self.symbol, timeframe=TIMEFRAME, limit=30)
+                df = calculate_indicators(pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"]))
+                current_atr = df["atr"].iloc[-1]
+                tight_sl = self.calculate_atr_stop_loss(current_price, current_atr, tier=3, direction=direction)
+                self.exchange.edit_position_trading_stop(self.symbol, stopLoss=tight_sl)
+            except Exception as e:
+                print(f"Tier 3 Trailing Stop update failed: {e}", flush=True)
+
+        # Check for campaign completion
         positions = self.exchange.fetch_positions([self.symbol], params={"category": "linear"})
         has_open_position = any(float(p.get("contracts", 0) or p.get("size", 0)) > 0 for p in positions)
 
-        # Transition Check: Advance upon tier profit completion
-        if not has_open_position and self.state["status"] == "RUNNING":
-            
-            # Map Table Realized Profits for re-investment sizing
-            pnl_map = {1: 16.80, 2: 38.25, 3: 118.00, 4: 87.00}
-            self.state["realized_pnl_history"][str(active_tier)] = pnl_map.get(active_tier, 0.0)
-
-            send_telegram(
-                f"✅ <b>TIER {active_tier} COMPLETED</b>\n"
-                f"Realized Tier Profit: +${pnl_map.get(active_tier, 0.0):.2f} USDT"
-            )
-
-            if active_tier < 4:
-                self.queue_conditional_tier(active_tier + 1)
-            else:
-                self.state["status"] = "COMPLETED"
-                StateManager.save_state(self.state)
-                send_telegram("🎉 <b>4-TIER CASCADING MATRIX CAMPAIGN COMPLETED!</b>")
+        if not has_open_position and not has_pending_order and active_tier >= 5:
+            self.state["status"] = "COMPLETED"
+            StateManager.save_state(self.state)
+            send_telegram("🎉 <b>5-TIER CASCADING MATRIX CAMPAIGN COMPLETED!</b>")
 
 
 # ------------------------------------------------------------------

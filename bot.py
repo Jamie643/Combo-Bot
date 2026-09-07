@@ -401,18 +401,24 @@ class CascadingMatrixManager:
         cp = ticker["last"]
 
         notional_value = max(margin_to_use * config["leverage"], MIN_ORDER_USD)
-        qty = notional_value / cp
+        raw_qty = notional_value / cp
+
+        # Format price & quantity according to exchange market precision specifications
+        formatted_price = float(self.exchange.price_to_precision(self.symbol, cp))
+        formatted_qty = float(self.exchange.amount_to_precision(self.symbol, raw_qty))
+        formatted_tp = float(self.exchange.price_to_precision(self.symbol, config["tp_price"]))
+        formatted_sl = float(self.exchange.price_to_precision(self.symbol, config["sl_price"]))
 
         try:
             order = self.exchange.create_order(
                 symbol=self.symbol,
                 type="limit",
                 side="buy" if self.state["direction"] == "LONG" else "sell",
-                amount=qty,
-                price=cp,
+                amount=formatted_qty,
+                price=formatted_price,
                 params={
-                    "stopLoss": f"{config['sl_price']:.4f}",
-                    "takeProfit": f"{config['tp_price']:.4f}",
+                    "takeProfit": str(formatted_tp),
+                    "stopLoss": str(formatted_sl),
                     "timeInForce": "PostOnly",
                     "positionIdx": 0,
                 },
@@ -424,8 +430,8 @@ class CascadingMatrixManager:
 
             send_telegram(
                 f"🚀 <b>CASCADING TIER 1 EXECUTED</b>\n"
-                f"<b>Pair:</b> {self.symbol} | <b>Price:</b> ${cp:.4f}\n"
-                f"<b>TP:</b> ${config['tp_price']:.4f} | <b>SL:</b> ${config['sl_price']:.4f}\n"
+                f"<b>Pair:</b> {self.symbol} | <b>Price:</b> ${formatted_price}\n"
+                f"<b>TP:</b> ${formatted_tp} | <b>SL:</b> ${formatted_sl}\n"
                 f"<b>Margin Allocated:</b> ${margin_to_use:.2f} USDT (35% Smart Size)\n"
                 f"<b>Leverage:</b> {config['leverage']}x Base Conservative"
             )
@@ -441,7 +447,6 @@ class CascadingMatrixManager:
         safe_set_leverage(self.exchange, config["leverage"], self.symbol)
 
         avail_usdt = self.fetch_available_usdt()
-        # Scale margin based on accumulated/compounded wallet balance
         margin_to_use = avail_usdt * SMART_MARGIN_PCT
 
         if margin_to_use <= 0:
@@ -449,7 +454,14 @@ class CascadingMatrixManager:
             return
 
         notional_value = max(margin_to_use * config["leverage"], MIN_ORDER_USD)
-        qty = notional_value / config["entry_price"]
+        raw_qty = notional_value / config["entry_price"]
+
+        # Format inputs with exchange precision rules
+        formatted_entry = float(self.exchange.price_to_precision(self.symbol, config["entry_price"]))
+        formatted_trigger = float(self.exchange.price_to_precision(self.symbol, config["trigger_price"]))
+        formatted_qty = float(self.exchange.amount_to_precision(self.symbol, raw_qty))
+        formatted_tp = float(self.exchange.price_to_precision(self.symbol, config["tp_price"]))
+        formatted_sl = float(self.exchange.price_to_precision(self.symbol, config["sl_price"]))
 
         ticker = self.exchange.fetch_ticker(self.symbol)
         cp = ticker["last"]
@@ -460,14 +472,14 @@ class CascadingMatrixManager:
                 symbol=self.symbol,
                 type="limit",
                 side="buy" if self.state["direction"] == "LONG" else "sell",
-                amount=qty,
-                price=config["entry_price"],
+                amount=formatted_qty,
+                price=formatted_entry,
                 params={
-                    "triggerPrice": f"{config['trigger_price']:.4f}",
+                    "triggerPrice": str(formatted_trigger),
                     "triggerBy": "LastPrice",
                     "triggerDirection": trigger_dir,
-                    "stopLoss": f"{config['sl_price']:.4f}",
-                    "takeProfit": f"{config['tp_price']:.4f}",
+                    "takeProfit": str(formatted_tp),
+                    "stopLoss": str(formatted_sl),
                     "timeInForce": "PostOnly",
                     "positionIdx": 0,
                 },
@@ -481,8 +493,8 @@ class CascadingMatrixManager:
             send_telegram(
                 f"⏳ <b>TIER {tier} CONDITIONAL ORDER QUEUED</b>\n"
                 f"<b>Pair:</b> {self.symbol}\n"
-                f"<b>Trigger:</b> ${config['trigger_price']:.4f} | <b>Limit Entry:</b> ${config['entry_price']:.4f}\n"
-                f"<b>Target TP:</b> ${config['tp_price']:.4f} | <b>Leverage:</b> {config['leverage']}x\n"
+                f"<b>Trigger:</b> ${formatted_trigger} | <b>Limit Entry:</b> ${formatted_entry}\n"
+                f"<b>Target TP:</b> ${formatted_tp} | <b>Leverage:</b> {config['leverage']}x\n"
                 f"<b>Target Margin:</b> ${margin_to_use:.2f} USDT"
             )
         except Exception as e:
@@ -491,7 +503,6 @@ class CascadingMatrixManager:
     def evaluate_matrix_step(self):
         """Lifecycle evaluation loop running continuous regime scan + matrix transitions."""
         if self.state["status"] in ["COMPLETED", "FAILED_STOPPED_OUT", "IDLE"]:
-            # Scan pairs to find market breakout setup
             signal = scan_for_matrix_trigger(self.exchange)
             if signal:
                 self.initialize_campaign(signal)
@@ -590,6 +601,5 @@ def health_check():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-    # Start bot loop in background thread
     threading.Thread(target=bot_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=port)

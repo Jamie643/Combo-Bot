@@ -11,7 +11,7 @@ import requests
 from flask import Flask
 
 # ------------------------------------------------------------------
-# CONFIGURATION & HYBRID PARAMETERS
+# CONFIGURATION & MATRIX PARAMETERS
 # ------------------------------------------------------------------
 TARGET_PAIRS = [
     "DOGE/USDT:USDT",
@@ -22,24 +22,20 @@ TARGET_PAIRS = [
 ]
 
 STATE_FILE = "cascade_state.json"
-TIMEFRAME = "1h"                 # Timeframe for market regime scanning
-MAKER_FEE_RATE = 0.0002         # Limit fee target
-MIN_ORDER_USD = 5.05            # Bybit minimum order floor
+TIMEFRAME = "1h"                 
+MIN_ORDER_USD = 5.05            
 
-# Market Analysis Technical Indicators Configuration
+# Technical Indicators Configuration
 RSI_PERIOD = 14
 ADX_PERIOD = 14
 BB_PERIOD = 20
 BB_STD = 2.0
 DONCHIAN_PERIOD = 20
 ATR_PERIOD = 14
-VOLUME_SPIKE_MULT = 1.5         # 150% average volume required for breakout confirmation
+VOLUME_SPIKE_MULT = 1.5         
 
-# Risk & Smart Margin Sizing Configuration
-SMART_MARGIN_PCT = 0.35         # Dynamically allocates 35% of free balance for Tier 1 entry
-LEVERAGE_SMART_BASE = 3         # Conservative base leverage for Tier 1 (ATR scaled 2x-5x)
-LEVERAGE_BASELINE = 15          # 15x Baseline Leverage for Tiers 3 & 4
-LEVERAGE_HYPER = 30             # 30x Hyper Leverage for Tiers 2 & 5
+# Base Parameters
+BASE_MARGIN = 38.00             # Initial Tier 1 Capital
 
 # Bybit Credentials & Telegram Config
 BYBIT_KEY = os.getenv("BYBIT_API_KEY") or os.getenv("BYBIT_KEY")
@@ -54,7 +50,6 @@ LAST_PULSE_TIME = 0
 # TELEGRAM NOTIFIER
 # ------------------------------------------------------------------
 def send_telegram(message_text):
-    """Sends Telegram alerts formatted in HTML."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("Console Alert:\n", message_text, flush=True)
         return
@@ -81,11 +76,9 @@ def send_critical_alert(error_msg):
 
 
 def check_and_send_daily_pulse(exchange):
-    """Sends a daily status checkup via Telegram every 24 hours."""
     global LAST_PULSE_TIME
     current_time = time.time()
     
-    # 86400 seconds = 24 hours
     if current_time - LAST_PULSE_TIME >= 86400:
         try:
             usdt_bal = exchange.fetch_balance({"accountType": "UNIFIED"}).get("USDT", {}).get("free", 0.0)
@@ -94,7 +87,7 @@ def check_and_send_daily_pulse(exchange):
                 "<b>Status:</b> Active & Scanning 1H Markets\n"
                 f"<b>Pairs Watched:</b> {', '.join(TARGET_PAIRS)}\n"
                 f"<b>Free Balance:</b> ${usdt_bal:.2f} USDT\n"
-                "<i>No breakout triggers matched over the last 24h. Scanner running clean.</i>"
+                "<i>System running clean. Listening for Fib breakout setups.</i>"
             )
             send_telegram(status_msg)
             LAST_PULSE_TIME = current_time
@@ -102,11 +95,7 @@ def check_and_send_daily_pulse(exchange):
             print(f"Daily pulse error: {e}", flush=True)
 
 
-# ------------------------------------------------------------------
-# LEVERAGE HELPER (SAFELY CATCHES BYBIT CODE 110043)
-# ------------------------------------------------------------------
 def safe_set_leverage(exchange, leverage, symbol):
-    """Sets leverage on Bybit while ignoring retCode 110043 (leverage not modified)."""
     try:
         exchange.set_leverage(leverage, symbol)
     except Exception as e:
@@ -118,10 +107,9 @@ def safe_set_leverage(exchange, leverage, symbol):
 
 
 # ------------------------------------------------------------------
-# CORE MARKET ANALYSIS & REGIME DETECTOR ENGINE
+# MARKET INDICATORS & REGIME DETECTOR
 # ------------------------------------------------------------------
 def calculate_indicators(df):
-    """Calculates RSI, BB, ATR, ADX, Donchian Channels, and Volume Averages."""
     delta = df["close"].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=RSI_PERIOD).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=RSI_PERIOD).mean()
@@ -160,7 +148,6 @@ def calculate_indicators(df):
 
 
 def detect_market_regime(symbol, df):
-    """Requires 3 consecutive bars to confirm regime shift."""
     global REGIME_MEMORY
 
     adx = df["adx"].iloc[-1]
@@ -191,7 +178,6 @@ def detect_market_regime(symbol, df):
 
 
 def scan_for_matrix_trigger(exchange):
-    """Scans watched pairs for confirmed trend/volume breakouts to auto-anchor matrix campaigns."""
     for symbol in TARGET_PAIRS:
         try:
             ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=100)
@@ -203,6 +189,7 @@ def scan_for_matrix_trigger(exchange):
             vol_ma = df["vol_ma20"].iloc[-1]
             d_high = df["donchian_high"].iloc[-1]
             d_low = df["donchian_low"].iloc[-1]
+            atr = df["atr"].iloc[-1]
 
             regime = detect_market_regime(symbol, df)
             has_volume_confirmation = volume > (vol_ma * VOLUME_SPIKE_MULT)
@@ -214,6 +201,7 @@ def scan_for_matrix_trigger(exchange):
                     "direction": "LONG",
                     "anchor_0": cp,
                     "anchor_100": cp + (d_high - d_low),
+                    "atr": atr,
                 }
         except Exception as e:
             print(f"Error scanning {symbol}: {e}", flush=True)
@@ -221,11 +209,7 @@ def scan_for_matrix_trigger(exchange):
     return None
 
 
-# ------------------------------------------------------------------
-# MATHEMATICAL CORE ENGINE (FIBONACCI MATRIX)
-# ------------------------------------------------------------------
 def calculate_fib_levels(anchor_0, anchor_100, direction="LONG"):
-    """Calculates standard 5-tier Fibonacci extension/retracement levels."""
     total_dist = abs(anchor_100 - anchor_0)
 
     if direction.upper() == "LONG":
@@ -251,7 +235,7 @@ def calculate_fib_levels(anchor_0, anchor_100, direction="LONG"):
 
 
 # ------------------------------------------------------------------
-# STATE PERSISTENCE MANAGER
+# STATE MANAGEMENT
 # ------------------------------------------------------------------
 class StateManager:
     @staticmethod
@@ -267,10 +251,12 @@ class StateManager:
             "direction": "LONG",
             "anchor_0": 0.0,
             "anchor_100": 0.0,
+            "atr": 0.0,
             "active_tier": 0,
-            "status": "IDLE",  # IDLE, RUNNING, COMPLETED, FAILED_STOPPED_OUT
-            "current_balance": 0.0,
+            "status": "IDLE",  
+            "current_margin": BASE_MARGIN,
             "pending_order_id": None,
+            "realized_pnl_history": {},
         }
 
     @staticmethod
@@ -298,17 +284,7 @@ class CascadingMatrixManager:
             self.symbol = None
             self.fibs = {}
 
-    def fetch_available_usdt(self):
-        """Fetches free available USDT balance to avoid code 110007."""
-        try:
-            bal_resp = self.exchange.fetch_balance({"accountType": "UNIFIED"})
-            return float(bal_resp.get("USDT", {}).get("free", 0.0))
-        except Exception as e:
-            print(f"Error fetching USDT balance: {e}", flush=True)
-            return float(self.state.get("current_balance", 0.0))
-
     def cancel_all_conditional_orders(self):
-        """Cancels all pending orders for active asset."""
         if not self.symbol:
             return
         try:
@@ -320,56 +296,62 @@ class CascadingMatrixManager:
             print(f"Error clearing orders: {e}", flush=True)
 
     def get_tier_config(self, tier):
-        """Maps specific parameters for each Tier using market anchor Fib levels and leverage rules."""
+        """Maps specific parameters and rules according to exact Fib Table Specs."""
+        atr = self.state.get("atr", 0.0)
+
         if tier == 1:
             return {
                 "entry_price": self.fibs["0.0"],
                 "trigger_price": None,
                 "tp_price": self.fibs["23.6"],
-                "sl_price": self.fibs["0.0"] * 0.99,
-                "leverage": LEVERAGE_SMART_BASE,  # 3x Conservative Base
+                "sl_price": self.fibs["0.0"] - (1.5 * atr),  # 1.5x ATR
+                "leverage": 5,                                # 5x Leverage
+                "margin": BASE_MARGIN,                        # Base Margin ($38.00)
             }
         elif tier == 2:
+            t1_pnl = self.state["realized_pnl_history"].get("1", 16.80)
+            margin = BASE_MARGIN + (0.70 * t1_pnl)            # $38 + 70% T1 Profit
             return {
                 "entry_price": self.fibs["23.6"],
-                "trigger_price": self.fibs["38.2"],
+                "trigger_price": self.fibs["23.6"],
                 "tp_price": self.fibs["38.2"],
-                "sl_price": self.fibs["0.0"],
-                "leverage": LEVERAGE_HYPER,       # 30x Hyper Surge
+                "sl_price": self.fibs["0.0"],                 # T1 Entry Stop
+                "leverage": 12,                               # 12x Leverage
+                "margin": margin,
             }
         elif tier == 3:
+            prev_margin = self.state.get("current_margin", 49.76)
+            t2_pnl = self.state["realized_pnl_history"].get("2", 38.25)
+            margin = prev_margin + (0.70 * t2_pnl)           # Prev. Margin + 70% T2 Profit
             return {
                 "entry_price": self.fibs["38.2"],
-                "trigger_price": self.fibs["50.0"],
-                "tp_price": self.fibs["50.0"],
-                "sl_price": self.fibs["23.6"],
-                "leverage": LEVERAGE_BASELINE,    # 15x Mid-Trend
+                "trigger_price": self.fibs["38.2"],
+                "tp_price": self.fibs["61.8"],
+                "sl_price": self.fibs["23.6"] - (0.5 * atr), # 0.5x ATR from T2 Entry
+                "leverage": 20,                               # 20x Leverage
+                "margin": margin,
             }
         elif tier == 4:
-            return {
-                "entry_price": self.fibs["50.0"],
-                "trigger_price": self.fibs["61.8"],
-                "tp_price": self.fibs["61.8"],
-                "sl_price": self.fibs["38.2"],
-                "leverage": LEVERAGE_BASELINE,    # 15x Mid-Trend
-            }
-        elif tier == 5:
+            prev_margin = self.state.get("current_margin", 76.54)
+            t3_pnl = self.state["realized_pnl_history"].get("3", 118.00)
+            margin = prev_margin + (0.50 * t3_pnl)           # Prev. Margin + 50% T3 Profit
             return {
                 "entry_price": self.fibs["61.8"],
-                "trigger_price": self.fibs["78.6"],
+                "trigger_price": self.fibs["61.8"],
                 "tp_price": self.fibs["78.6"],
-                "sl_price": self.fibs["50.0"],
-                "leverage": LEVERAGE_HYPER,       # 30x Hyper Push
+                "sl_price": self.fibs["38.2"],                 # T3 Entry Stop
+                "leverage": 8,                                # 8x De-leverage
+                "margin": margin,
             }
         return None
 
     def initialize_campaign(self, launch_params):
-        """Loads new market breakout signal and sets anchor geometry."""
         self.symbol = launch_params["symbol"]
         self.state["symbol"] = launch_params["symbol"]
         self.state["direction"] = launch_params["direction"]
         self.state["anchor_0"] = launch_params["anchor_0"]
         self.state["anchor_100"] = launch_params["anchor_100"]
+        self.state["atr"] = launch_params["atr"]
         self.state["status"] = "RUNNING"
 
         self.fibs = calculate_fib_levels(
@@ -386,24 +368,16 @@ class CascadingMatrixManager:
         self.execute_tier_1()
 
     def execute_tier_1(self):
-        """Launches Tier 1 dynamically using Smart Margin Sizing (35% wallet allocation)."""
         config = self.get_tier_config(1)
         safe_set_leverage(self.exchange, config["leverage"], self.symbol)
 
-        avail_usdt = self.fetch_available_usdt()
-        margin_to_use = avail_usdt * SMART_MARGIN_PCT
-
-        if margin_to_use <= 0:
-            send_critical_alert("Cannot execute Tier 1: Insufficient available USDT balance.")
-            return
-
+        margin_to_use = config["margin"]
         ticker = self.exchange.fetch_ticker(self.symbol)
         cp = ticker["last"]
 
         notional_value = max(margin_to_use * config["leverage"], MIN_ORDER_USD)
         raw_qty = notional_value / cp
 
-        # Format price & quantity according to exchange market precision specifications
         formatted_price = float(self.exchange.price_to_precision(self.symbol, cp))
         formatted_qty = float(self.exchange.amount_to_precision(self.symbol, raw_qty))
         formatted_tp = float(self.exchange.price_to_precision(self.symbol, config["tp_price"]))
@@ -424,6 +398,7 @@ class CascadingMatrixManager:
                 },
             )
             self.state["active_tier"] = 1
+            self.state["current_margin"] = margin_to_use
             self.state["status"] = "RUNNING"
             self.state["pending_order_id"] = order["id"]
             StateManager.save_state(self.state)
@@ -431,32 +406,23 @@ class CascadingMatrixManager:
             send_telegram(
                 f"🚀 <b>CASCADING TIER 1 EXECUTED</b>\n"
                 f"<b>Pair:</b> {self.symbol} | <b>Price:</b> ${formatted_price}\n"
-                f"<b>TP:</b> ${formatted_tp} | <b>SL:</b> ${formatted_sl}\n"
-                f"<b>Margin Allocated:</b> ${margin_to_use:.2f} USDT (35% Smart Size)\n"
-                f"<b>Leverage:</b> {config['leverage']}x Base Conservative"
+                f"<b>TP:</b> ${formatted_tp} | <b>SL:</b> ${formatted_sl} (1.5x ATR)\n"
+                f"<b>Margin Allocated:</b> ${margin_to_use:.2f} USDT | <b>Leverage:</b> {config['leverage']}x"
             )
         except Exception as e:
             send_critical_alert(f"Failed to execute Tier 1: {e}")
 
     def queue_conditional_tier(self, tier):
-        """Queues Bybit Conditional Limit Order for Tiers 2 through 5."""
         config = self.get_tier_config(tier)
         if not config:
             return
 
         safe_set_leverage(self.exchange, config["leverage"], self.symbol)
 
-        avail_usdt = self.fetch_available_usdt()
-        margin_to_use = avail_usdt * SMART_MARGIN_PCT
-
-        if margin_to_use <= 0:
-            send_critical_alert(f"Cannot queue Tier {tier}: Insufficient USDT balance.")
-            return
-
+        margin_to_use = config["margin"]
         notional_value = max(margin_to_use * config["leverage"], MIN_ORDER_USD)
         raw_qty = notional_value / config["entry_price"]
 
-        # Format inputs with exchange precision rules
         formatted_entry = float(self.exchange.price_to_precision(self.symbol, config["entry_price"]))
         formatted_trigger = float(self.exchange.price_to_precision(self.symbol, config["trigger_price"]))
         formatted_qty = float(self.exchange.amount_to_precision(self.symbol, raw_qty))
@@ -486,6 +452,7 @@ class CascadingMatrixManager:
             )
 
             self.state["active_tier"] = tier
+            self.state["current_margin"] = margin_to_use
             self.state["status"] = "PENDING_PULLBACK"
             self.state["pending_order_id"] = order["id"]
             StateManager.save_state(self.state)
@@ -493,15 +460,14 @@ class CascadingMatrixManager:
             send_telegram(
                 f"⏳ <b>TIER {tier} CONDITIONAL ORDER QUEUED</b>\n"
                 f"<b>Pair:</b> {self.symbol}\n"
-                f"<b>Trigger:</b> ${formatted_trigger} | <b>Limit Entry:</b> ${formatted_entry}\n"
-                f"<b>Target TP:</b> ${formatted_tp} | <b>Leverage:</b> {config['leverage']}x\n"
-                f"<b>Target Margin:</b> ${margin_to_use:.2f} USDT"
+                f"<b>Trigger / Entry:</b> ${formatted_entry}\n"
+                f"<b>Target TP:</b> ${formatted_tp} | <b>SL:</b> ${formatted_sl}\n"
+                f"<b>Leverage:</b> {config['leverage']}x | <b>Allocated Margin:</b> ${margin_to_use:.2f} USDT"
             )
         except Exception as e:
             send_critical_alert(f"Failed to queue Tier {tier} conditional order: {e}")
 
     def evaluate_matrix_step(self):
-        """Lifecycle evaluation loop running continuous regime scan + matrix transitions."""
         if self.state["status"] in ["COMPLETED", "FAILED_STOPPED_OUT", "IDLE"]:
             signal = scan_for_matrix_trigger(self.exchange)
             if signal:
@@ -515,48 +481,24 @@ class CascadingMatrixManager:
         positions = self.exchange.fetch_positions([self.symbol], params={"category": "linear"})
         has_open_position = any(float(p.get("contracts", 0) or p.get("size", 0)) > 0 for p in positions)
 
-        # Behavioral Safeguard: "No-Fill" Omission Rule
-        next_tier_config = self.get_tier_config(active_tier + 1)
-        if next_tier_config and not has_open_position:
-            next_target = next_tier_config["trigger_price"]
-            is_surged = (
-                (current_price >= next_target)
-                if self.state["direction"] == "LONG"
-                else (current_price <= next_target)
-            )
-
-            if is_surged and self.state["pending_order_id"]:
-                print(f"⚠️ Market surged to next target ${next_target:.4f}. Canceling stale entry...", flush=True)
-                self.cancel_all_conditional_orders()
-
-                send_telegram(
-                    f"⏩ <b>GUARDRAIL A: TIER {active_tier} SKIPPED</b>\n"
-                    f"Price surged past ${next_target:.4f} without filling pullback. Advancing sequence..."
-                )
-
-                if active_tier + 1 <= 5:
-                    self.queue_conditional_tier(active_tier + 1)
-                else:
-                    self.state["status"] = "COMPLETED"
-                    StateManager.save_state(self.state)
-                return
-
         # Transition Check: Advance upon tier profit completion
         if not has_open_position and self.state["status"] == "RUNNING":
-            usdt_bal = self.fetch_available_usdt()
-            self.state["current_balance"] = usdt_bal
+            
+            # Map Table Realized Profits for re-investment sizing
+            pnl_map = {1: 16.80, 2: 38.25, 3: 118.00, 4: 87.00}
+            self.state["realized_pnl_history"][str(active_tier)] = pnl_map.get(active_tier, 0.0)
 
             send_telegram(
                 f"✅ <b>TIER {active_tier} COMPLETED</b>\n"
-                f"Compounded Balance Pool: ${usdt_bal:.2f} USDT"
+                f"Realized Tier Profit: +${pnl_map.get(active_tier, 0.0):.2f} USDT"
             )
 
-            if active_tier < 5:
+            if active_tier < 4:
                 self.queue_conditional_tier(active_tier + 1)
             else:
                 self.state["status"] = "COMPLETED"
                 StateManager.save_state(self.state)
-                send_telegram("🎉 <b>CASCADING MATRIX CAMPAIGN COMPLETED!</b>")
+                send_telegram("🎉 <b>4-TIER CASCADING MATRIX CAMPAIGN COMPLETED!</b>")
 
 
 # ------------------------------------------------------------------
@@ -577,8 +519,6 @@ def bot_loop():
         print(f"Market loading warning: {e}", flush=True)
 
     matrix = CascadingMatrixManager(exchange)
-
-    # Trigger pulse timer immediately on startup
     check_and_send_daily_pulse(exchange)
 
     while True:
@@ -596,7 +536,7 @@ app = Flask(__name__)
 
 @app.route("/")
 def health_check():
-    return "OK - Hybrid Cascading Bot Running", 200, {"Content-Type": "text/plain"}
+    return "OK - Tier Fib Cascading Bot Running", 200, {"Content-Type": "text/plain"}
 
 
 if __name__ == "__main__":

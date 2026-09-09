@@ -22,7 +22,7 @@ TARGET_PAIRS = [
 ]
 
 STATE_FILE = "cascade_state.json"
-TIMEFRAME = "1h"                 
+TIMEFRAME = "1h"            
 MIN_ORDER_USD = 5.05            
 
 # Technical Indicators Configuration
@@ -516,8 +516,14 @@ class CascadingMatrixManager:
             # --- TIER ADVANCE LOGIC ---
             if surged_past and not self.state.get("orders_placed", {}).get(str(next_tier)):
                 if next_tier == 2:
-                    t1_entry = self.fibs["0.0"]
-                    self.exchange.edit_position_trading_stop(self.symbol, stopLoss=t1_entry)
+                    t1_entry = float(self.exchange.price_to_precision(self.symbol, self.fibs["0.0"]))
+                    side = "buy" if direction == "LONG" else "sell"
+                    self.exchange.set_trading_stop(
+                        symbol=self.symbol,
+                        side=side,
+                        stop_loss=t1_entry,
+                        params={"positionIdx": 0}
+                    )
                     send_telegram(f"🔒 <b>Tier 2 Activated</b>: Position Stop Loss trail-locked to Tier 1 Entry (${t1_entry}).")
 
                 self.state["active_tier"] = next_tier
@@ -531,7 +537,15 @@ class CascadingMatrixManager:
                 df = calculate_indicators(pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"]))
                 current_atr = df["atr"].iloc[-1]
                 tight_sl = self.calculate_atr_stop_loss(current_price, current_atr, tier=3, direction=direction)
-                self.exchange.edit_position_trading_stop(self.symbol, stopLoss=tight_sl)
+                formatted_tight_sl = float(self.exchange.price_to_precision(self.symbol, tight_sl))
+                side = "buy" if direction == "LONG" else "sell"
+                
+                self.exchange.set_trading_stop(
+                    symbol=self.symbol,
+                    side=side,
+                    stop_loss=formatted_tight_sl,
+                    params={"positionIdx": 0}
+                )
             except Exception as e:
                 print(f"Tier 3 Trailing Stop update failed: {e}", flush=True)
 

@@ -1967,7 +1967,7 @@ class ExecutionEngine:
         tier["qty"] = qty
         cid = self._cid(campaign["campaign_id"], tier["tier"], "entry")
         params = {"timeInForce": "PostOnly", "orderLinkId": cid}
-                 try:
+          try:
              order = await self.client.place_order(
                  symbol, side, "limit", qty, price, params)
              return True, order
@@ -1984,7 +1984,7 @@ class ExecutionEngine:
         params_taker = {"orderLinkId": cid}
         try:
             order = await self.client.place_order(
-                symbol, side, "limit", qty,
+                symbol, side, "my limit", qty,
                 self.client.round_price(symbol, adj), params_taker)
             return True, order
         except Exception as exc:  # noqa: BLE001

@@ -1974,3 +1974,856 @@ class ExecutionEngine:
         except Exception as exc:  # noqa: BLE001
             log.error("place_entry tier %d failed %s: %s", tier["tier"], symbol, exc)
             return False, {}
+                  if not CONFIG["POST_ONLY_FALLBACK"]:
+            return False, {}
+        adj = price * (1 + CONFIG["TRIGGER_SLIPPAGE_TOLERANCE"]) \
+            if side == "buy" else price * (1 - CONFIG["TRIGGER_SLIPPAGE_TOLERANCE"])
+        params_taker = {"orderLinkId": cid}
+        try:
+            order = await self.client.place_order(
+                symbol, side, "limit", qty,
+                self.client.round_price(symbol, adj), params_taker)
+            return True, order
+        except Exception as exc:  # noqa: BLE001
+            log.warning("taker limit failed %s T%d (%s); market fallback",
+                        symbol, tier["tier"], exc)
+        try:
+            order = await self.client.place_order(
+                symbol, side, "market", qty, None, params_taker)
+            await self.notifier.send(
+                self.notifier.fmt_guardrail(
+                    "H", f"{symbol} T{tier['tier']} filled via MARKET fallback"),
+                "guardrail", campaign["campaign_id"])
+            return True, order
+        except Exception as exc:  # noqa: BLE001
+            log.error("entry placement failed entirely %s T%d: %s",
+                      symbol, tier["tier"], exc)
+            return False, {}
+
+    async def place_sl(self, campaign: Dict[str, Any], price: float) -> Optional[str]:
+        """Place a new reduce-only stop order at `price`; return order id."""
+        symbol = campaign["symbol"]
+        direction = campaign["direction"]
+        qty = self._position_qty(campaign)
+        if qty <= 0:
+            log.error("place_sl: no qty for %s", symbol)
+            return None
+        side = "sell" if direction == "LONG" else "buy"
+        try:
+            order = await self.client.place_order(
+                symbol, side, "market", qty, None,
+                {"triggerPrice": self.client.round_price(symbol, price),
+                 "reduceOnly": True,
+                 "orderLinkId": self._cid(campaign["campaign_id"], 0, "sl")})
+            oid = order["id"]
+            campaign["sl_order_id"] = oid
+            return oid
+        except Exception as exc:  # noqa: BLE001
+            log.error("SL placement failed %s @ %s: %s", symbol, price, exc)
+            await self.notifier.send(
+                self.notifier.fmt_critical(
+                    "ExecutionEngine", f"SL placement failed {symbol} @ {price}",
+                    "Position may be unprotected — manual check required"),
+                "critical", campaign["campaign_id"], critical=True)
+            return None
+
+    async def cancel_order_safe(self, symbol: str, order_id: Optional[str]) -> None:
+        """Cancel an order; log but never raise."""
+        if not order_id:
+            return
+        try:
+            await self.client.cancel_order(order_id, symbol)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("cancel %s/%s failed: %s", symbol, order_id, exc)
+
+    async def ratchet_sl(self, campaign: Dict[str, Any], new_sl: float) -> bool:
+        """Protocol: place NEW SL, confirm, THEN cancel old."""
+        old_id = campaign.get("sl_order_id")
+        new_id = await self.place_sl(campaign, new_sl)
+        if new_id is None:
+            return False
+        campaign["stop_loss"]["current"] = new_sl
+        if old_id and old_id != new_id:
+            await self.cancel_order_safe(campaign["symbol"], old_id)
+        campaign["last_updated"] = iso_now()
+        return True
+
+    def _position_qty(self, campaign: Dict[str, Any]) -> float:
+        return round(sum(float(t.get("qty") or 0)
+                         for t in campaign["tiers"]
+                         if t["status"] == "FILLED"), 8)
+
+    async def place_tp(self, campaign: Dict[str, Any]) -> None:
+        """Place reduce-only TP limit for the full filled qty."""
+        symbol = campaign["symbol"]
+        qty = self._position_qty(campaign)
+        if qty <= 0:
+            return
+        side = "sell" if campaign["direction"] == "LONG" else "buy"
+        price = float(campaign["take_profit"]["price"])
+        try:
+            order = await self.client.place_order(
+                symbol, side, "limit", qty,
+                self.client.round_price(symbol, price),
+                {"reduceOnly": True,
+                 "orderLinkId": self._cid(campaign["campaign_id"], 0, "tp")})
+            campaign["tp_order_id"] = order["id"]
+        except Exception as exc:  # noqa: BLE001
+            log.error("TP placement failed %s: %s", symbol, exc)
+
+    async def close_position_market(self, campaign: Dict[str, Any],
+                                    reason: str) -> Tuple[float, float]:
+        """Market-reduce the full position; return (net_pnl, fees)."""
+        symbol = campaign["symbol"]
+        qty = self._position_qty(campaign)
+        side = "sell" if campaign["direction"] == "LONG" else "buy"
+        fees = 0.0
+        if qty > 0:
+            try:
+                order = await self.client.place_order(
+                    symbol, side, "market", qty, None,
+                    {"reduceOnly": True,
+                     "orderLinkId": self._cid(campaign["campaign_id"], 0, "close")})
+                fees = float(order.get("fee", {}).get("cost") or 0)
+            except Exception as exc:  # noqa: BLE001
+                log.error("market close failed %s: %s", symbol, exc)
+        await self.cancel_order_safe(symbol, campaign.get("sl_order_id"))
+        await self.cancel_order_safe(symbol, campaign.get("tp_order_id"))
+        for t in campaign["tiers"]:
+            await self.cancel_order_safe(symbol, t.get("order_id"))
+            t["status"] = "CANCELLED" if t["status"] == "PENDING" else t["status"]
+        net = 0.0
+        try:
+            for p in await self.client.fetch_positions():
+                if p.get("symbol_raw") == symbol:
+                    net = float(p.get("unrealizedPnl") or 0)
+        except Exception:  # noqa: BLE001
+            pass
+        campaign["state"] = "CLOSED"
+        campaign["exit_reason"] = reason
+        campaign["last_updated"] = iso_now()
+        return net, fees
+
+    async def on_tier_fill(self, campaign: Dict[str, Any], tier_no: int,
+                           fill_price: float, qty: float, fee: float) -> None:
+        """Handle a tier fill: mark filled, ratchet SL, arm next tier."""
+        tier = campaign["tiers"][tier_no - 1]
+        tier["status"] = "FILLED"
+        tier["fill_price"] = fill_price
+        tier["fill_time"] = iso_now()
+        tier["qty"] = qty
+        campaign["highest_filled_tier"] = max(
+            campaign["highest_filled_tier"], tier_no)
+        campaign["stop_loss"]["state"] = f"BRACKET_{tier_no - 1}"
+        campaign["stop_loss"]["next_ratchet_on"] = (
+            f"Tier {tier_no + 1} fill" if tier_no < len(campaign["tiers"])
+            else "TP hit or trailing")
+
+        # FIX 1: re-place TP on EVERY tier fill so it covers the full position
+        await self.cancel_order_safe(campaign["symbol"], campaign.get("tp_order_id"))
+        await self.place_tp(campaign)
+
+        # FIX 7: capture the actual prior SL for the ratchet alert
+        old_sl = float(campaign["stop_loss"]["current"])
+        new_sl = CascadePlanner.ratchet_sl(campaign, tier_no)
+        if new_sl is not None:
+            ok = await self.ratchet_sl(campaign, new_sl)
+            if ok:
+                if tier_no > 1:
+                    msg = self.notifier.fmt_sl_ratchet(campaign, old_sl, new_sl)
+                else:
+                    msg = (f"🔒 *SL Set — {campaign['symbol']}*\n"
+                           f"`{new_sl}` \\(`BRACKET_{tier_no - 1}`\\)")
+                await self.notifier.send(msg, "sl_ratchet", campaign["campaign_id"])
+
+        if tier_no < len(campaign["tiers"]) and not campaign.get("frozen"):
+            nxt = campaign["tiers"][tier_no]
+            if nxt["status"] == "PENDING":
+                side = ("buy" if campaign["direction"] == "LONG" else "sell")
+                await self._arm_next_tier(campaign, nxt, side)
+        campaign["last_updated"] = iso_now()
+        await self.state.persist()
+        await self.notifier.send(
+            self.notifier.fmt_tier_fill(campaign, tier),
+            "tier_fill", campaign["campaign_id"])
+
+    async def _arm_next_tier(self, campaign: Dict[str, Any], tier: Dict[str, Any],
+                             side: str) -> None:
+        ok, order = await self._place_entry(campaign, tier, side)
+        if ok:
+            tier["status"] = "PLACED"
+            tier["order_id"] = order["id"]
+            self.state.pending_orders().append({
+                "order_id": order["id"],
+                "client_order_id": order.get("clientOrderId"),
+                "campaign_id": campaign["campaign_id"],
+                "tier": tier["tier"], "type": "PostOnlyLimit",
+                "price": tier["trigger_price"], "qty": tier["qty"],
+                "status": "OPEN", "side": side,
+            })
+        else:
+            log.warning("could not arm tier %s T%d", campaign["symbol"],
+                        tier["tier"])
+
+    async def check_invalidation(self, campaign: Dict[str, Any],
+                                 last_close: float) -> None:
+        """Freeze further tiers if price re-enters the prior bracket."""
+        hft = campaign["highest_filled_tier"]
+        if hft < 1 or campaign.get("frozen"):
+            if hft >= 1 and campaign.get("frozen") and hft < len(campaign["tiers"]):
+                tier = campaign["tiers"][hft - 1]
+                trig = float(tier["trigger_price"])
+                direction = campaign["direction"]
+                nxt = campaign["tiers"][hft]
+                if ((direction == "LONG" and last_close >= trig) or
+                        (direction == "SHORT" and last_close <= trig)):
+                    campaign["frozen"] = False
+                    side = "buy" if direction == "LONG" else "sell"
+                    if nxt["status"] == "FROZEN":
+                        await self._arm_next_tier(campaign, nxt, side)
+            return
+        tier = campaign["tiers"][hft - 1]
+        trig = float(tier["trigger_price"])
+        half_zone = float(tier["zone_width"])
+        direction = campaign["direction"]
+        invalidated = (last_close < trig - half_zone) if direction == "LONG" \
+            else (last_close > trig + half_zone)
+        if invalidated and hft < len(campaign["tiers"]):
+            nxt = campaign["tiers"][hft]
+            if nxt["status"] in ("PENDING", "PLACED"):
+                await self.cancel_order_safe(campaign["symbol"], nxt.get("order_id"))
+                nxt["status"] = "FROZEN"
+            campaign["frozen"] = True
+            await self.notifier.send(
+                self.notifier.fmt_guardrail(
+                    "B — Invalidation",
+                    f"{campaign['symbol']} price re-entered Tier {hft} bracket; "
+                    f"further tiers frozen. SL unchanged at "
+                    f"{campaign['stop_loss']['current']}."),
+                "guardrail_b", campaign["campaign_id"])
+            await self.state.persist()
+
+    async def abort_campaign(self, campaign: Dict[str, Any], reason: str) -> None:
+        """Guardrail C/E: close position, cancel pendings, archive, alert."""
+        net, fees = await self.close_position_market(campaign, reason)
+        wallet = self.ledger.attribute_close(campaign, net, fees, reason)
+        self.state.archive_campaign(campaign)
+        await self.state.persist()
+        await self.notifier.send(
+            self.notifier.fmt_campaign_close(
+                campaign, net, float(wallet.get("balance_usdt") or 0),
+                float(wallet.get("drawdown_pct") or 0), reason),
+            "campaign_close", campaign["campaign_id"])
+
+
+# =====================================================================
+# SECTION 11 — STAGE 4: POSITION RECONCILER
+# =====================================================================
+
+
+class PositionReconciler:
+    """Stage 4.3: keep state in sync with Bybit reality every 30s."""
+
+    def __init__(self, client: BybitClient, state: StateManager,
+                 notifier: Notifier, ledger: PortfolioLedger,
+                 engine: ExecutionEngine) -> None:
+        self.client = client
+        self.state = state
+        self.notifier = notifier
+        self.ledger = ledger
+        self.engine = engine
+
+    async def reconcile(self) -> None:
+        """Single reconciliation pass (called by the loop)."""
+        try:
+            positions, open_orders = await asyncio.gather(
+                self.client.fetch_positions(), self.client.fetch_open_orders())
+        except Exception as exc:  # noqa: BLE001
+            log.warning("reconcile fetch failed: %s", exc)
+            return
+        pos_map = {p.get("symbol_raw", p["symbol"]): p for p in positions}
+        order_ids = {o["id"] for o in open_orders}
+
+        for campaign in list(self.state.campaigns()):
+            await self._reconcile_campaign(campaign, pos_map.get(campaign["symbol"]),
+                                           order_ids)
+        for symbol in pos_map:
+            if self.state.get_campaign_by_symbol(symbol) is None:
+                await self.notifier.send(
+                    self.notifier.fmt_critical(
+                        "PositionReconciler",
+                        f"Orphan position on {symbol} not tracked by bot",
+                        "Manual review required; not touching per policy"),
+                    "orphan", "-", critical=True)
+        self.state.state["meta"]["last_reconcile_ts"] = iso_now()
+        await self.ledger.refresh_wallet()
+        await self.state.persist()
+
+    async def _reconcile_campaign(self, campaign: Dict[str, Any],
+                                  position: Optional[Dict[str, Any]],
+                                  order_ids: set) -> None:
+        symbol = campaign["symbol"]
+        has_position = position is not None and abs(
+            float(position.get("contracts") or 0)) > 0
+        if not has_position:
+            filled_any = any(t["status"] == "FILLED" for t in campaign["tiers"])
+            if campaign["state"] == "ACTIVE" and filled_any:
+                await self.engine.abort_campaign(campaign, "Position closed externally")
+            elif campaign["state"] == "ACTIVE":
+                for t in campaign["tiers"]:
+                    await self.engine.cancel_order_safe(symbol, t.get("order_id"))
+                await self.engine.cancel_order_safe(symbol, campaign.get("sl_order_id"))
+                await self.engine.cancel_order_safe(symbol, campaign.get("tp_order_id"))
+                campaign["state"] = "CLOSED"
+                campaign["exit_reason"] = "No position — pending orders expired"
+                self.state.archive_campaign(campaign)
+                await self.state.persist()
+            return
+        expected = self.engine._position_qty(campaign)  # noqa: SLF001
+        actual = float(position.get("contracts") or 0)
+        if abs(actual - expected) > max(expected * 0.01, 1e-6):
+            await self.notifier.send(
+                self.notifier.fmt_guardrail(
+                    "D — Size mismatch",
+                    f"{symbol}: state expects {expected}, exchange shows {actual}. "
+                    f"Correcting to exchange."),
+                "size_mismatch", campaign["campaign_id"])
+            campaign["size_reconciled_to_exchange"] = actual
+        if campaign.get("sl_order_id") and campaign["sl_order_id"] not in order_ids:
+            sl_price = float(campaign["stop_loss"]["current"])
+            new_id = await self.engine.place_sl(campaign, sl_price)
+            if new_id:
+                await self.notifier.send(
+                    self.notifier.fmt_critical(
+                        "PositionReconciler",
+                        f"SL order missing for {symbol}",
+                        f"Re-placed SL @ {sl_price}"),
+                    "critical", campaign["campaign_id"], critical=True)
+        for t in campaign["tiers"]:
+            if t["status"] == "PLACED" and t.get("order_id") not in order_ids:
+                t["status"] = "PENDING"
+                t.pop("order_id", None)
+        entry = datetime.fromisoformat(campaign["entry_time"].replace("Z", "+00:00"))
+        if (now_utc() - entry).total_seconds() > CONFIG["MAX_CAMPAIGN_DURATION_HOURS"] * 3600:
+            await self.engine.abort_campaign(campaign, "Guardrail E: max duration")
+
+
+# =====================================================================
+# SECTION 12 — ORCHESTRATOR: HEARTBEAT, DAILY PULSE, EVENT LOOPS
+# =====================================================================
+
+
+class Bot:
+    """Orchestrates all stages: scan cycle, reconciler, heartbeat, pulse."""
+
+    def __init__(self) -> None:
+        self.state = StateManager()
+        self.client = BybitClient()
+        self.notifier = Notifier()
+        self.ledger = PortfolioLedger(self.state, self.client)
+        self.scanner = MarketScanner(self.client)
+        self.ledger.scanner = self.scanner
+        self.regime = RegimeDetector(self.client)
+        self.planner = CascadePlanner(self.client, self.ledger)
+        self.engine = ExecutionEngine(self.client, self.state, self.notifier,
+                                      self.ledger)
+        self.reconciler = PositionReconciler(self.client, self.state,
+                                             self.notifier, self.ledger,
+                                             self.engine)
+        self.capital = CapitalQueue(self.state, self.ledger, self.notifier)
+        self.ws = BybitWebSocket(self.client)
+        self.ws.register(self._on_ws_event)
+        self.halt_new_campaigns = False
+        self._accepting = True
+        self._tasks: List[asyncio.Task] = []
+        self._start_ts = time.time()
+        self._last_scan_ts: Optional[str] = None
+        self._last_heartbeat_ts: Optional[str] = None
+
+    async def startup(self) -> None:
+        """Load state, acquire lock, reconcile with exchange, resume."""
+        self.state.acquire_lock()
+        atexit.register(self.state.release_lock)
+        self.state.load()
+        await self.client.load_markets()
+        log.info("CascadeBot starting | testnet=%s | mode=%s",
+                 BYBIT_TESTNET, self.state.state["meta"]["mode"])
+        await self.ledger.refresh_wallet()
+        try:
+            await self.reconciler.reconcile()
+        except Exception as exc:  # noqa: BLE001
+            log.critical("boot reconcile failed: %s", exc)
+            await self.notifier.send(
+                self.notifier.fmt_critical(
+                    "Boot", f"Initial reconciliation failed: {exc}",
+                    "Starting anyway; next reconcile in 30s"),
+                "critical", "-", critical=True)
+        await self.state.persist()
+
+    async def shutdown(self) -> None:
+        """Graceful shutdown: persist, cancel pendings (keep SL), release lock."""
+        log.info("graceful shutdown initiated")
+        self._accepting = False
+        try:
+            await self.state.persist()
+            for campaign in self.state.campaigns():
+                for t in campaign["tiers"]:
+                    if t["status"] == "PLACED":
+                        await self.engine.cancel_order_safe(
+                            campaign["symbol"], t.get("order_id"))
+                        t["status"] = "PENDING"
+                await self.engine.cancel_order_safe(campaign["symbol"],
+                                                    campaign.get("tp_order_id"))
+            await self.state.persist()
+        except Exception as exc:  # noqa: BLE001
+            log.error("shutdown persist/cancel failed: %s", exc)
+        try:
+            await asyncio.wait_for(self.ws.stop(), timeout=5)
+        except Exception:  # noqa: BLE001
+            pass
+        await self.notifier.close()
+        await self.client.close()
+        self.state.release_lock()
+        log.info("shutdown complete — positions remain open on Bybit")
+
+    async def run_scan_cycle(self) -> None:
+        """One full pipeline pass: scan -> regime -> campaigns -> persist."""
+        if not self._accepting:
+            return
+        try:
+            self._last_scan_ts = iso_now()
+            self.state.state["meta"]["last_scan_ts"] = self._last_scan_ts
+            scan = await self.scanner.scan()
+            regimes = await self.regime.evaluate(scan["candidates"])
+            wallet = float(self.state.state["wallet"].get("balance_usdt") or 0)
+            for r in regimes["advanced"]:
+                if self.halt_new_campaigns or not self._accepting:
+                    break
+                if self.state.get_campaign_by_symbol(r["symbol"]):
+                    continue
+                campaign = await self.planner.build_campaign(
+                    r, wallet, self.state.campaigns(),
+                    self.ledger.deployed_margin())
+                if campaign is None:
+                    continue
+                allowed, reason = await self.ledger.check_portfolio_gates(
+                    float(campaign["deployed_margin"]))
+                if not allowed:
+                    log.info("portfolio gate blocked %s: %s", r["symbol"], reason)
+                    if reason == "drawdown_halt":
+                        w = self.state.state["wallet"]
+                        await self.notifier.send(
+                            self.notifier.fmt_drawdown_halt(
+                                float(w.get("drawdown_pct") or 0),
+                                float(w.get("balance_usdt") or 0),
+                                float(w.get("peak_balance") or 0)),
+                            "drawdown_halt", "-", critical=True)
+                    continue
+                await self.engine.arm_campaign(campaign)
+                wallet = float(self.state.state["wallet"].get("balance_usdt") or wallet)
+            await self.state.persist()
+        except Exception as exc:  # noqa: BLE001
+            log.exception("scan cycle failed: %s", exc)
+            await self.notifier.send(
+                self.notifier.fmt_critical(
+                    "ScanCycle", str(exc)[:300], "Cycle skipped; next in 15 min"),
+                "critical", "-", critical=True)
+
+    async def _on_ws_event(self, event: Dict[str, Any]) -> None:
+        """Dispatch Bybit order/position events to the campaign lifecycle."""
+        try:
+            data = event.get("data", {})
+            if event.get("topic") == "order":
+                await self._on_order_event(data)
+            elif event.get("topic") == "position":
+                await self._on_position_event(data)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("WS event handling failed: %s", exc)
+
+    async def _on_order_event(self, data: Dict[str, Any]) -> None:
+        order_id = data.get("orderId")
+        status = data.get("orderStatus")
+        symbol_raw = data.get("symbol_raw", data.get("symbol", ""))
+        campaign = self._campaign_for_order(order_id, symbol_raw)
+        if campaign is None:
+            return
+        if status in ("Filled", "PartiallyFilled"):
+            filled_qty = float(data.get("cumExecQty") or data.get("qty") or 0)
+            fill_price = float(data.get("avgPrice") or data.get("price") or 0)
+            fee = float(data.get("cumExecFee") or 0)
+            tier_no = self._tier_for_order(campaign, order_id)
+            if tier_no:
+                self.state.remove_pending_order(order_id)
+                await self.engine.on_tier_fill(campaign, tier_no, fill_price,
+                                               filled_qty, fee)
+            elif data.get("reduceOnly") or order_id in (
+                    campaign.get("sl_order_id"), campaign.get("tp_order_id")):
+                reason = ("TP hit" if order_id == campaign.get("tp_order_id")
+                          else "SL hit")
+                net = float(data.get("closedPnl") or 0)
+                fees = float(data.get("cumExecFee") or 0)
+                campaign["state"] = "CLOSED"
+                campaign["exit_reason"] = reason
+                wallet = self.ledger.attribute_close(campaign, net, fees, reason)
+                self.state.archive_campaign(campaign)
+                await self.state.persist()
+                await self.notifier.send(
+                    self.notifier.fmt_campaign_close(
+                        campaign, net, float(wallet.get("balance_usdt") or 0),
+                        float(wallet.get("drawdown_pct") or 0), reason),
+                    "campaign_close", campaign["campaign_id"])
+                await self.capital.deploy_if_idle()
+
+    def _campaign_for_order(self, order_id: Optional[str],
+                            symbol: str) -> Optional[Dict[str, Any]]:
+        if not order_id:
+            return self.state.get_campaign_by_symbol(symbol)
+        for c in self.state.campaigns():
+            if order_id in (c.get("sl_order_id"), c.get("tp_order_id")):
+                return c
+            for t in c["tiers"]:
+                if t.get("order_id") == order_id:
+                    return c
+        for o in self.state.pending_orders():
+            if o["order_id"] == order_id:
+                return self.state.get_campaign(o["campaign_id"])
+        return self.state.get_campaign_by_symbol(symbol)
+
+    @staticmethod
+    def _tier_for_order(campaign: Dict[str, Any], order_id: str) -> Optional[int]:
+        for t in campaign["tiers"]:
+            if t.get("order_id") == order_id:
+                return int(t["tier"])
+        return None
+
+    async def _on_position_event(self, data: Dict[str, Any]) -> None:
+        symbol = data.get("symbol_raw", data.get("symbol", ""))
+        campaign = self.state.get_campaign_by_symbol(symbol)
+        if campaign is None:
+            return
+        size = float(data.get("size") or 0)
+        if size == 0 and campaign["state"] == "ACTIVE":
+            await self.engine.abort_campaign(campaign, "Position closed (WS)")
+
+    async def _compose_heartbeat(self, status: str = "healthy") -> str:
+        """Build the 4H proof-of-life report (always sent)."""
+        w = self.state.state["wallet"]
+        perf = self.state.state["performance"]
+        meta = self.state.state["meta"]
+        lines = [
+            f"{'🟢' if status == 'healthy' else '🟡'} BOT ALIVE — "
+            f"{now_utc():%Y-%m-%d %H:%M} UTC",
+            "",
+            "💰 ACCOUNT",
+            f"Balance:     ${float(w.get('balance_usdt') or 0):.2f}",
+            f"Peak:        ${float(w.get('peak_balance') or 0):.2f}",
+            f"Drawdown:    {float(w.get('drawdown_pct') or 0) * 100:.1f}%",
+            f"Free margin: ${float(w.get('free_margin') or 0):.2f}",
+            f"Used margin: ${float(w.get('used_margin') or 0):.2f}",
+            "",
+            "📊 TODAY",
+            f"Campaigns closed: {self._today_closed()}",
+            f"Net P&L today:    {float(perf.get('realized_pnl_today') or 0):+.2f}",
+            f"Fees today:       -{float(perf.get('fees_today') or 0):.2f}",
+            "",
+            f"🎯 ACTIVE CAMPAIGNS ({len(self.state.campaigns())})",
+        ]
+        for c in self.state.campaigns():
+            filled = [t for t in c["tiers"] if t["status"] == "FILLED"]
+            pend = [t for t in c["tiers"] if t["status"] in ("PENDING", "PLACED")]
+            entry = f"  Tier 1 filled @ {filled[0].get('fill_price')}" if filled \
+                else "  Tier 1 pending"
+            lines.append(f"{c['symbol']} {c['direction']} — {c['conviction_class']} "
+                         f"({c['stage2_confidence']:.2f})")
+            lines.append(entry)
+            if pend:
+                lines.append(f"  Next: Tier {pend[0]['tier']} @ "
+                             f"{pend[0]['trigger_price']}")
+            lines.append(f"  SL: {c['stop_loss']['current']} | "
+                         f"TP: {c['take_profit']['price']}")
+        lines += [
+            "",
+            "⚙️ SYSTEM",
+            f"Last scan:        {self._age_str(self._last_scan_ts)}",
+            f"Last reconcile:   "
+            f"{self._age_str(meta.get('last_reconcile_ts'))}",
+            f"Bybit API:        {self.client.last_latency_ms:.0f}ms",
+            f"Mode:             {meta['mode']}",
+            f"Base unit:        ${meta['base_unit']:.2f}",
+        ]
+        reserved = float(w.get("reserved_capital") or 0)
+        if reserved > 0:
+            lines.append(f"Queued top-up:    ${reserved:.2f}")
+        lines += [
+            "",
+            "📈 ALL-TIME",
+            f"Completed: {int(perf.get('completed_campaigns') or 0)} campaigns",
+            f"Win rate:  {float(perf.get('win_rate') or 0) * 100:.1f}%",
+            f"Max DD:    {float(perf.get('max_drawdown_pct') or 0) * 100:.1f}%",
+        ]
+        return "\n".join(lines)
+
+    def _today_closed(self) -> int:
+        recent = self.state.state.get("closed_campaigns_recent", [])
+        today = now_utc().date()
+        n = 0
+        for c in recent:
+            try:
+                if datetime.fromisoformat(
+                        c.get("last_updated", "").replace("Z", "+00:00")).date() == today:
+                    n += 1
+            except ValueError:
+                continue
+        return n
+
+    @staticmethod
+    def _age_str(ts: Optional[str]) -> str:
+        if not ts:
+            return "never"
+        try:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            s = (now_utc() - dt).total_seconds()
+        except ValueError:
+            return "unknown"
+        if s < 90:
+            return f"{s:.0f} sec ago"
+        return f"{s / 60:.0f} min ago"
+
+    async def send_heartbeat(self) -> None:
+        """Send the 4H heartbeat; classify healthy/warning by subsystem state."""
+        status = "healthy"
+        scan_age = 0.0
+        if self._last_scan_ts:
+            scan_age = (now_utc() - datetime.fromisoformat(
+                self._last_scan_ts.replace("Z", "+00:00"))).total_seconds()
+        if self.client.last_latency_ms > 1000:
+            status = "warning"
+        if scan_age > CONFIG["SCAN_INTERVAL_MIN"] * 60 * 3:
+            status = "critical"
+        msg = await self._compose_heartbeat(status)
+        if status == "critical":
+            msg = ("🔴 BOT ALIVE — degraded\n\n🚨 CRITICAL\n"
+                   f"Last successful scan: {self._age_str(self._last_scan_ts)} "
+                   f"(expected <{CONFIG['SCAN_INTERVAL_MIN']} min)\n\n") + msg
+        elif status == "warning":
+            msg = ("🟡 BOT ALIVE — warning\n\n⚠️ WARNING\n"
+                   f"Bybit API latency elevated: "
+                   f"{self.client.last_latency_ms:.0f}ms\n\n") + msg
+        await self.notifier.send(msg, "heartbeat", "-", force=True)
+        self._last_heartbeat_ts = iso_now()
+
+    async def send_daily_pulse(self) -> None:
+        """Send the 00:00 UTC daily summary."""
+        w = self.state.state["wallet"]
+        perf = self.state.state["performance"]
+        meta = self.state.state["meta"]
+        msg = (
+            f"📊 *Daily Pulse — {now_utc():%Y-%m-%d}*\n\n"
+            f"Wallet: `${float(w.get('balance_usdt') or 0):.2f}` "
+            f"\\(Δ `{float(perf.get('realized_pnl_today') or 0):+.2f}`\\)\n"
+            f"Peak: `${float(w.get('peak_balance') or 0):.2f}` | "
+            f"DD: `{float(w.get('drawdown_pct') or 0) * 100:.1f}%`\n"
+            f"Active campaigns: `{len(self.state.campaigns())}`\n"
+            f"Completed today: `{self._today_closed()}`\n"
+            f"Win rate \\(all-time\\): "
+            f"`{float(perf.get('win_rate') or 0) * 100:.1f}%`\n"
+            f"Avg win: `{float(perf.get('avg_win_pct') or 0) * 100:+.1f}%` | "
+            f"Avg loss: `{float(perf.get('avg_loss_pct') or 0) * 100:+.1f}%`\n"
+            f"Fees today: `-{float(perf.get('fees_today') or 0):.2f}`\n"
+            f"Mode: `{meta['mode']}` | Base unit: `${meta['base_unit']:.2f}`"
+        )
+        reserved = float(w.get("reserved_capital") or 0)
+        if reserved > 0:
+            msg += f"\nNext top-up: queued `${reserved:.2f}`"
+        await self.notifier.send(msg, "daily_pulse", "-", force=True)
+
+    def status_summary(self) -> str:
+        """Compact status for the Telegram /status command."""
+        w = self.state.state["wallet"]
+        return (f"🤖 *CascadeBot status*\n"
+                f"Balance: `${float(w.get('balance_usdt') or 0):.2f}` | "
+                f"DD: `{float(w.get('drawdown_pct') or 0) * 100:.1f}%`\n"
+                f"Mode: `{self.state.state['meta']['mode']}`\n"
+                f"Active: `{len(self.state.campaigns())}` | "
+                f"Halt new: `{self.halt_new_campaigns}`\n"
+                f"Last scan: {self._age_str(self._last_scan_ts)}")
+
+    async def scan_loop(self) -> None:
+        """15-minute scan cycle."""
+        while True:
+            await self.run_scan_cycle()
+            await asyncio.sleep(CONFIG["SCAN_INTERVAL_MIN"] * 60)
+
+    async def reconcile_loop(self) -> None:
+        """30-second reconciliation + capital queue detection."""
+        while True:
+            try:
+                await self.reconciler.reconcile()
+                await self.capital.detect_topups()
+                await self.capital.deploy_if_idle()
+            except Exception as exc:  # noqa: BLE001
+                log.exception("reconcile loop error: %s", exc)
+            await asyncio.sleep(CONFIG["RECONCILE_INTERVAL_S"])
+
+    async def heartbeat_loop(self) -> None:
+        """Fire at every UTC hour in HEARTBEAT_UTC_HOURS (4H cadence)."""
+        while True:
+            now = now_utc()
+            if now.hour in CONFIG["HEARTBEAT_UTC_HOURS"] and now.minute < 5:
+                try:
+                    await self.send_heartbeat()
+                except Exception as exc:  # noqa: BLE001
+                    log.error("heartbeat failed: %s", exc)
+            await asyncio.sleep(60)
+
+    async def daily_pulse_loop(self) -> None:
+        """Fire once per day shortly after 00:00 UTC."""
+        fired_date = None
+        while True:
+            now = now_utc()
+            if now.hour == 0 and now.minute < 5 and fired_date != now.date():
+                fired_date = now.date()
+                try:
+                    await self.send_daily_pulse()
+                    self.ledger.daily_reset()
+                    await self.state.persist()
+                except Exception as exc:  # noqa: BLE001
+                    log.error("daily pulse failed: %s", exc)
+            await asyncio.sleep(60)
+
+    async def invalidation_loop(self) -> None:
+        """Guardrail B watch: poll closes for bracket re-entry (60s cadence)."""
+        while True:
+            try:
+                for campaign in list(self.state.campaigns()):
+                    if campaign["highest_filled_tier"] < 1:
+                        continue
+                    try:
+                        df = await self.client.fetch_klines(campaign["symbol"],
+                                                            "1h", 5)
+                        await self.engine.check_invalidation(
+                            campaign, float(df["close"].iloc[-1]))
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("invalidation check %s failed: %s",
+                                    campaign["symbol"], exc)
+            except Exception as exc:  # noqa: BLE001
+                log.exception("invalidation loop error: %s", exc)
+            await asyncio.sleep(CONFIG["INVALIDATION_INTERVAL_S"])
+
+    async def run(self) -> None:
+        """Start all tasks and run until cancelled."""
+        await self.startup()
+        self.ws.start()
+        self._tasks = [
+            asyncio.create_task(self.scan_loop(), name="scan-loop"),
+            asyncio.create_task(self.reconcile_loop(), name="reconcile-loop"),
+            asyncio.create_task(self.heartbeat_loop(), name="heartbeat-loop"),
+            asyncio.create_task(self.daily_pulse_loop(), name="daily-pulse-loop"),
+            asyncio.create_task(self.invalidation_loop(), name="invalidation-loop"),
+            asyncio.create_task(self.notifier.poll_commands(self), name="tg-poller"),
+        ]
+        log.info("all loops started")
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+
+
+# =====================================================================
+# SECTION 13 — FLASK HEALTH SERVER
+# =====================================================================
+
+
+def build_flask_app(bot: Bot) -> Flask:
+    """Create the Flask health server (called on a worker thread)."""
+    app = Flask("cascade-health")
+
+    def _auth_ok() -> bool:
+        auth = request.headers.get("Authorization", "")
+        return bool(HEALTH_API_TOKEN) and auth == f"Bearer {HEALTH_API_TOKEN}"
+
+    @app.get("/")
+    def index() -> Any:
+        return "OK", 200
+
+    @app.get("/health")
+    def health() -> Any:
+        w = bot.state.state["wallet"]
+        return jsonify({
+            "status": "healthy",
+            "uptime_seconds": int(time.time() - bot._start_ts),
+            "last_scan": bot._last_scan_ts,
+            "last_reconcile": bot.state.state["meta"].get("last_reconcile_ts"),
+            "last_heartbeat": bot._last_heartbeat_ts,
+            "active_campaigns": len(bot.state.campaigns()),
+            "bybit_api_latency_ms": round(bot.client.last_latency_ms, 1),
+            "state_file_age_seconds": _state_age(),
+            "mode": bot.state.state["meta"]["mode"],
+            "wallet_balance": float(w.get("balance_usdt") or 0),
+        }), 200
+
+    @app.get("/state")
+    def state_route() -> Any:
+        if not _auth_ok():
+            return jsonify({"error": "unauthorized"}), 401
+        return jsonify(bot.state.state), 200
+
+    def _state_age() -> int:
+        try:
+            return int(time.time() - os.path.getmtime(CONFIG["STATE_FILE"]))
+        except OSError:
+            return -1
+
+    return app
+
+
+def run_flask(bot: Bot) -> None:
+    """Entry point for the Flask worker thread."""
+    app = build_flask_app(bot)
+    app.run(host=CONFIG["FLASK_BIND"], port=CONFIG["FLASK_PORT"],
+            threaded=True, use_reloader=False)
+
+
+# =====================================================================
+# SECTION 14 — ENTRY POINT
+# =====================================================================
+
+
+def main() -> None:
+    """Entry point: wire signal handlers, start Flask thread, run the bot."""
+    bot = Bot()
+    loop_holder: Dict[str, Any] = {}
+
+    def _handle_signal(sig: int, _frame: Any) -> None:
+        log.info("received signal %d; initiating graceful shutdown", sig)
+        loop = loop_holder.get("loop")
+        if loop and loop.is_running():
+            asyncio.ensure_future(bot.shutdown(), loop=loop)
+            loop.call_later(CONFIG["GRACEFUL_SHUTDOWN_TIMEOUT_S"], loop.stop)
+
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+
+    import threading
+    flask_thread = threading.Thread(target=run_flask, args=(bot,), daemon=True,
+                                    name="flask-health")
+    flask_thread.start()
+
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop_holder["loop"] = loop
+        loop.run_until_complete(bot.run())
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    except RuntimeError:
+        log.info("event loop stopped")
+    except Exception as exc:  # noqa: BLE001
+        log.critical("fatal error in main: %s", exc, exc_info=True)
+    finally:
+        try:
+            loop_holder["loop"].run_until_complete(bot.shutdown())
+        except Exception:  # noqa: BLE001
+            pass
+        log.info("exiting")
+
+
+if __name__ == "__main__":
+    main()

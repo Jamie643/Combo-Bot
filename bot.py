@@ -1128,9 +1128,10 @@ class MarketScanner:
                     (time.time() - self._correlation_ts) / 60, 1),
             },
         }
-        top = ", ".join(f"{c['symbol']}({c['composite_score']:.2f})"
+                top = ", ".join(f"{c['symbol']}({c['composite_score']:.2f})"
                         for c in ranked[:5])
         log.info("Stage1 top-5: %s", top or "none")
+        log.info("Stage1 rejection breakdown: %s", result["rejected_summary"])   # <-- ADD THIS
         return result
 
 

@@ -1967,17 +1967,20 @@ class ExecutionEngine:
         tier["qty"] = qty
         cid = self._cid(campaign["campaign_id"], tier["tier"], "entry")
         params = {"timeInForce": "PostOnly", "orderLinkId": cid}
-        try:
-            order = await self.client.place_order(
-                symbol, side, "limit", qty, price, params)
-            return True, order
-        except Exception as exc:  # noqa: BLE001
-            log.error("place_entry tier %d failed %s: %s", tier["tier"], symbol, exc)
-            return False, {}
-                  if not CONFIG["POST_ONLY_FALLBACK"]:
-            return False, {}
-        adj = price * (1 + CONFIG["TRIGGER_SLIPPAGE_TOLERANCE"]) \
-            if side == "buy" else price * (1 - CONFIG["TRIGGER_SLIPPAGE_TOLERANCE"])
+                 try:
+             order = await self.client.place_order(
+                 symbol, side, "limit", qty, price, params)
+             return True, order
+         except Exception as exc:  # noqa: BLE001
+-            log.error("place_entry tier %d failed %s: %s", tier["tier"], symbol, exc)
+-            return False, {}
+-                  if not CONFIG["POST_ONLY_FALLBACK"]:
++            log.warning("post-only rejected %s T%d (%s); falling back",
++                        symbol, tier["tier"], exc)
++        if not CONFIG["POST_ONLY_FALLBACK"]:
+             return False, {}
+         adj = price * (1 + CONFIG["TRIGGER_SLIPPAGE_TOLERANCE"]) \
+             if side == "buy" else price * (1 - CONFIG["TRIGGER_SLIPPAGE_TOLERANCE"])
         params_taker = {"orderLinkId": cid}
         try:
             order = await self.client.place_order(

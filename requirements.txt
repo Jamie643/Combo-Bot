@@ -1,6 +1,8 @@
 ccxt
-pandas
-numpy
 aiohttp
 flask
 python-dotenv
+numpy
+pandas
+uvloop
+aiosqlite
